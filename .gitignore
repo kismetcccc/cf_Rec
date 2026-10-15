@@ -1,0 +1,17 @@
+# Local data and generated experiments
+data/*
+!data/.gitkeep
+log/*
+!log/.gitkeep
+*.pth
+*.pt
+*.ckpt
+# Local development files
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+.env
+.env.*

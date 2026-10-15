@@ -1,0 +1,29 @@
+# Selected sparse_anchor_nohcl; no alternate algorithms.
+implementation_version: lgmrec-opt-standalone-anchor-v1
+embedding_size: 64
+feat_embed_dim: 64
+behavior_eta: 0.2
+behavior_topk: 10
+behavior_minimum: 2
+behavior_block_size: 1024
+reg_weight: [1e-6]
+dataset_overrides:
+  baby:
+    n_ui_layers: [4]
+    n_mm_layers: [2]
+    n_hyper_layer: [1]
+    alpha: [0.1]
+    init_reference_width: 4
+  sports:
+    n_ui_layers: [4]
+    n_mm_layers: [2]
+    n_hyper_layer: [1]
+    alpha: [0.6]
+    init_reference_width: 4
+  clothing:
+    n_ui_layers: [2]
+    n_mm_layers: [2]
+    n_hyper_layer: [2]
+    alpha: [0.2]
+    init_reference_width: 64
+hyper_parameters: [n_ui_layers, n_mm_layers, n_hyper_layer, alpha, reg_weight]

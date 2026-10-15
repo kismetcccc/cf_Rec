@@ -1,0 +1,45 @@
+embedding_size: 64
+feat_embed_dim: 64
+cf_model: lightgcn
+
+# Relocated without changing the previous dataset-specific baseline settings.
+implementation_version: lgmrec-reference-deterministic-v1
+dataset_overrides:
+  baby:
+    n_ui_layers: [4]
+    n_mm_layers: [2]
+    n_hyper_layer: [1]
+    hyper_num: [4]
+    keep_rate: [0.5]
+    alpha: [0.1]
+    cl_weight: [1e-4]
+    reg_weight: [1e-6]
+  clothing:
+    n_ui_layers: [2]
+    n_mm_layers: [2]
+    n_hyper_layer: [2]
+    hyper_num: [64]
+    keep_rate: [0.2]
+    alpha: [0.2]
+    cl_weight: [1e-4]
+    reg_weight: [1e-6]
+  sports:
+    n_ui_layers: [4]
+    n_mm_layers: [2]
+    n_hyper_layer: [1]
+    hyper_num: [4]
+    keep_rate: [0.4]
+    alpha: [0.6]
+    cl_weight: [1e-4]
+    reg_weight: [1e-6]
+
+# n_ui_layers: [1, 2, 3, 4]
+# n_mm_layers: [1, 2, 3, 4]
+# n_hyper_layer: [1, 2, 3, 4]
+# hyper_num: [2, 4, 8, 16, 32, 64, 128, 256]
+# keep_rate: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+# alpha: [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+# cl_weight : [0.0, 1e-06, 1e-05, 1e-04, 1e-03, 1e-02, 0.1]
+# reg_weight : [0.0, 1e-06, 1e-05, 1e-04, 1e-03, 1e-02, 0.1]
+
+hyper_parameters: ["n_ui_layers", "n_mm_layers", "n_hyper_layer", "hyper_num", "keep_rate",  "alpha", "cl_weight", "reg_weight"]
