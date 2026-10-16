@@ -5,6 +5,7 @@ Behavior construction adapts MSCA; see UPSTREAM_SOURCE below.
 import hashlib
 import json
 import math
+from logging import getLogger
 from numbers import Integral
 
 import numpy as np
@@ -15,11 +16,13 @@ from torch.nn import functional as F
 
 from common.abstract_recommender import GeneralRecommender
 
-IMPLEMENTATION_VERSION = 'lgmrec-opt-standalone-anchor-v1'
+IMPLEMENTATION_VERSION = 'lgmrec-opt-item-contrast-v2'
+ITEM_CL_WEIGHT = 1e-4
+ITEM_CL_TEMPERATURE = 0.2
 
 
 class LGMRecOpt(GeneralRecommender):
-    """Standalone implementation of the selected sparse_anchor_nohcl method.
+    """Anchor hypergraph model with item hypergraph-to-final contrast.
 
     Algorithmically derived from LGMRec and MSCA-style behavior propagation;
     no dependency on the LGMRec model class and no alternate model branches.
@@ -29,6 +32,9 @@ class LGMRecOpt(GeneralRecommender):
         super().__init__(config, dataset)
         if config['protocol'] != 'train_only':
             raise ValueError('Only train_only is supported')
+        config['implementation_version'] = IMPLEMENTATION_VERSION
+        self.item_cl_weight = ITEM_CL_WEIGHT
+        self.item_cl_temperature = ITEM_CL_TEMPERATURE
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_ui_layers = config['n_ui_layers']
@@ -79,6 +85,14 @@ class LGMRecOpt(GeneralRecommender):
         self.sparse_hypergraph.metadata.update(
             train_graph_fingerprint=self.behavior_view.cache_fingerprint,
             user_aggregation='train_mean', routing='deterministic', incidence_dropout=False)
+        self.sparse_hypergraph.metadata['item_contrast'] = dict(
+            implementation_version=IMPLEMENTATION_VERSION,
+            loss='unidirectional-same-and-cross-view-infonce', weight=self.item_cl_weight,
+            temperature=self.item_cl_temperature, items='unique-batch-positive-and-negative',
+            views='visual-plus-textual-hypergraph vs final-after-behavior-residual',
+            anchor='final', same_view_negatives=True, stop_gradient=False)
+        getLogger().info('LGMRecOpt item contrast: %s',
+                         json.dumps(self.sparse_hypergraph.metadata['item_contrast']))
         self.pre_epoch_processing()
 
     def scipy_matrix_to_sparse_tenser(self, matrix, shape):
@@ -140,7 +154,7 @@ class LGMRecOpt(GeneralRecommender):
             features = torch.sparse.mm(self.norm_adj, features)
         return features
 
-    def forward(self):
+    def forward(self, return_hyper=False):
         collaborative = self.cge()
         visual = torch.mm(self.image_embedding.weight, self.item_image_trs)
         visual_local = self.mge(visual)
@@ -160,21 +174,54 @@ class LGMRecOpt(GeneralRecommender):
         users, items = torch.split(combined, [self.n_users, self.n_items], dim=0)
         residual = self.behavior_view(self.item_id_embedding.weight)
         ru, ri = torch.split(residual, [self.n_users, self.n_items], dim=0)
-        return users + self.behavior_eta * ru, items + self.behavior_eta * ri
+        final_users = users + self.behavior_eta * ru
+        final_items = items + self.behavior_eta * ri
+        if return_hyper:
+            return final_users, final_items, iv + it
+        return final_users, final_items
+
+    def item_contrastive_loss(self, hyper_items, final_items, item_ids):
+        """MMHCL-inspired one-way SCL adapted to distinct TRAIN-batch items.
+
+        Each distinct TRAIN-batch item is one class; its two views are the
+        positive pair, with the final view as anchor. Other item IDs supply
+        final-view and hypergraph-view negatives; final-view self-pairs are
+        excluded. Both views receive gradients, without a reverse loss term.
+        No extra sampling or full-catalog logits are used.
+        """
+        item_ids = torch.unique(item_ids)
+        if item_ids.numel() < 2:
+            return (hyper_items[item_ids].sum() + final_items[item_ids].sum()) * 0.0
+        hyper = F.normalize(hyper_items[item_ids], dim=1)
+        final = F.normalize(final_items[item_ids], dim=1)
+        cross_logits = (final @ hyper.T) / self.item_cl_temperature
+        same_logits = (final @ final.T) / self.item_cl_temperature
+        same_logits = same_logits.masked_fill(
+            torch.eye(item_ids.numel(), dtype=torch.bool, device=final.device),
+            float('-inf'))
+        log_denominator = torch.logaddexp(
+            torch.logsumexp(same_logits, dim=1),
+            torch.logsumexp(cross_logits, dim=1))
+        return (log_denominator - cross_logits.diagonal()).mean()
 
     def calculate_loss(self, interaction):
         if interaction.ndim != 2 or interaction.size(0) != 3:
             raise ValueError('Expected one TRAIN negative per positive')
         uid, positive, negative = interaction.long()
-        users, items = self.forward()
+        users, items, hyper_items = self.forward(return_hyper=True)
         u, p, n = users[uid], items[positive], items[negative]
         ranking = self.bpr_loss(u, p, n)
         penalty = self.reg_weight * self.reg_loss(u, p, n)
+        contrast = self.item_contrastive_loss(
+            hyper_items, items, torch.cat((positive, negative)))
+        weighted_contrast = self.item_cl_weight * contrast
         if self.training:
-            for key, value in {'loss_bpr': ranking, 'loss_reg': penalty}.items():
+            for key, value in {'loss_bpr': ranking, 'loss_reg': penalty,
+                               'loss_item_cl_raw': contrast,
+                               'loss_item_cl_weighted': weighted_contrast}.items():
                 self._sums[key] = self._sums.get(key, 0.) + float(value.detach()) * uid.numel()
             self._count += uid.numel()
-        return ranking + penalty
+        return ranking + penalty + weighted_contrast
 
     def full_sort_predict(self, interaction):
         users, items = self.forward()
