@@ -1,10 +1,13 @@
-"""LGMRec optimization and its TRAIN-only behavior/hypergraph operators.
+"""TRAIN-only recommendation: local encoding, anchor hypergraph, behavior residual.
 
-Behavior construction adapts MSCA; see UPSTREAM_SOURCE below.
+LGMRecOpt contains the model; the two nn.Module helpers below implement its
+parameter-free graph operators. Behavior construction adapts MSCA; see
+UPSTREAM_SOURCE below. The active objective is BPR plus representation regularization.
 """
 import hashlib
 import json
 import math
+import os
 from logging import getLogger
 from numbers import Integral
 
@@ -16,13 +19,12 @@ from torch.nn import functional as F
 
 from common.abstract_recommender import GeneralRecommender
 
-IMPLEMENTATION_VERSION = 'lgmrec-opt-item-contrast-v2'
-ITEM_CL_WEIGHT = 1e-4
-ITEM_CL_TEMPERATURE = 0.2
+IMPLEMENTATION_VERSION = 'lgmrec-opt-train-canonical-v3'
+ARCHITECTURE_REVISION = 3
 
 
 class LGMRecOpt(GeneralRecommender):
-    """Anchor hypergraph model with item hypergraph-to-final contrast.
+    """Anchor hypergraph with an identity-propagation diagnostic control.
 
     Algorithmically derived from LGMRec and MSCA-style behavior propagation;
     no dependency on the LGMRec model class and no alternate model branches.
@@ -30,11 +32,21 @@ class LGMRecOpt(GeneralRecommender):
 
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
+        # Complete-input representations shared only within an evaluation pass.
+        # Plain attributes: neither checkpoint state nor trainable structure.
+        self._eval_embeddings = None
         if config['protocol'] != 'train_only':
             raise ValueError('Only train_only is supported')
-        config['implementation_version'] = IMPLEMENTATION_VERSION
-        self.item_cl_weight = ITEM_CL_WEIGHT
-        self.item_cl_temperature = ITEM_CL_TEMPERATURE
+        # Read once per model; explicit per-command settings keep paired runs clear.
+        self.hyper_propagation = os.environ.get('LGMRECOPT_HYPER_PROPAGATION', 'group')
+        if self.hyper_propagation not in ('group', 'identity'):
+            raise ValueError('LGMRECOPT_HYPER_PROPAGATION must be group or identity')
+        self.implementation_version = f'{IMPLEMENTATION_VERSION}-{self.hyper_propagation}'
+        config['implementation_version'] = self.implementation_version
+        config['hyper_propagation'] = self.hyper_propagation
+        # Separate restored behavior propagation from the intermediate version
+        # that omitted it; equal parameter shapes do not imply equal computation.
+        self.register_buffer('_architecture_revision', torch.tensor(ARCHITECTURE_REVISION, dtype=torch.int64))
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
         self.n_ui_layers = config['n_ui_layers']
@@ -45,20 +57,30 @@ class LGMRecOpt(GeneralRecommender):
         self.behavior_eta = float(config['behavior_eta'])
         if self.embedding_dim != self.feat_embed_dim:
             raise ValueError('ID and modality embedding dimensions must match')
-        if self.n_hyper_layer < 1 or self.alpha <= 0:
+        for name, value in [('n_ui_layers', self.n_ui_layers), ('n_mm_layers', self.n_mm_layer)]:
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f'{name} must be a non-negative integer')
+        if self.n_hyper_layer < 1 or not math.isfinite(self.alpha) or self.alpha <= 0:
             raise ValueError('Anchor hypergraph requires positive layers and alpha')
+        if not math.isfinite(self.reg_weight) or self.reg_weight < 0:
+            raise ValueError('reg_weight must be finite and non-negative')
         if not math.isfinite(self.behavior_eta) or self.behavior_eta < 0:
             raise ValueError('behavior_eta must be finite and non-negative')
         if self.v_feat is None or self.t_feat is None:
             raise ValueError('Both modality features are required')
+        for features in (self.v_feat, self.t_feat):
+            if features.ndim != 2 or features.shape[0] != self.n_items or features.shape[1] < 1:
+                raise ValueError('Features must have one nonempty row per catalog item')
         if not torch.isfinite(self.v_feat).all() or not torch.isfinite(self.t_feat).all():
             raise ValueError('Features must be finite')
         self.n_nodes = self.n_users + self.n_items
-        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
+        # All graph operators use the same binary TRAIN history. Otherwise
+        # duplicate events inflate the readout while its degree is deduplicated.
+        self.interaction_matrix = _canonical_interactions(dataset.inter_matrix(form='coo')).tocoo()
         # Rebuild TRAIN graphs at construction; follow .to() without storing
         # dataset-specific graphs in checkpoints.
-        self.register_buffer('adj', self.scipy_matrix_to_sparse_tenser(
-            self.interaction_matrix, (self.n_users, self.n_items)), persistent=False)
+        self.register_buffer('adj', _scipy_to_torch(
+            self.interaction_matrix, self.device), persistent=False)
         degree, norm_adj = self.get_norm_adj_mat()
         self.register_buffer('norm_adj', norm_adj, persistent=False)
         self.register_buffer('num_inters',
@@ -84,31 +106,48 @@ class LGMRecOpt(GeneralRecommender):
             self.behavior_view.structural_adjacency, layers=self.n_hyper_layer)
         self.sparse_hypergraph.metadata.update(
             train_graph_fingerprint=self.behavior_view.cache_fingerprint,
-            user_aggregation='train_mean', routing='deterministic', incidence_dropout=False)
+            user_aggregation='train_mean', routing='deterministic', incidence_dropout=False,
+            behavior_output_branch=True, behavior_eta=self.behavior_eta)
+        self.sparse_hypergraph.metadata['propagation'] = dict(
+            mode=self.hyper_propagation,
+            support_built=True, attention_computed=self.hyper_propagation == 'group',
+            effective_layers=self.n_hyper_layer if self.hyper_propagation == 'group' else 0,
+            item_input='cge_items',
+            item_output='group_propagated' if self.hyper_propagation == 'group' else 'identity',
+            user_readout='train_mean_of_hyper_items',
+            fusion='normalize_visual_plus_text_then_alpha')
+        getLogger().info('LGMRecOpt hypergraph propagation: %s',
+                         json.dumps(self.sparse_hypergraph.metadata['propagation']))
+        # Keep an explicit disabled marker for readers of experiment summaries.
         self.sparse_hypergraph.metadata['item_contrast'] = dict(
-            implementation_version=IMPLEMENTATION_VERSION,
-            loss='unidirectional-same-and-cross-view-infonce', weight=self.item_cl_weight,
-            temperature=self.item_cl_temperature, items='unique-batch-positive-and-negative',
-            views='visual-plus-textual-hypergraph vs final-after-behavior-residual',
-            anchor='final', same_view_negatives=True, stop_gradient=False)
-        getLogger().info('LGMRecOpt item contrast: %s',
-                         json.dumps(self.sparse_hypergraph.metadata['item_contrast']))
+            enabled=False, computed=False, weight=0.0)
         self.pre_epoch_processing()
 
-    def scipy_matrix_to_sparse_tenser(self, matrix, shape):
-        row = matrix.row
-        col = matrix.col
-        i = torch.LongTensor(np.array([row, col]))
-        data = torch.FloatTensor(matrix.data)
-        return torch.sparse_coo_tensor(
-            i,
-            data,
-            shape,
-            device=self.device,
-        ).coalesce()
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        self._eval_embeddings = None
+        revision = state_dict.get(prefix + '_architecture_revision')
+        if revision is not None and (
+                not isinstance(revision, torch.Tensor) or revision.numel() != 1
+                or revision.item() != ARCHITECTURE_REVISION):
+            error_msgs.append(f'{prefix}incompatible LGMRecOpt architecture revision; '
+                              f'expected {ARCHITECTURE_REVISION}')
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
+    def train(self, mode=True):
+        # Trainer calls eval() at the start of each evaluation, including when
+        # already in eval mode. Never reuse representations across these calls.
+        self._eval_embeddings = None
+        return super().train(mode)
+
+    def _apply(self, fn, recurse=True):
+        # Cached tensors must not survive device/dtype changes.
+        self._eval_embeddings = None
+        return super()._apply(fn, recurse=recurse)
 
     def get_norm_adj_mat(self):
+        """Symmetric degree-normalized TRAIN user-item adjacency."""
         inter_M = self.interaction_matrix
         users = inter_M.row
         items = inter_M.col + self.n_users
@@ -124,22 +163,16 @@ class LGMRecOpt(GeneralRecommender):
         )
         A.sum_duplicates()
         A.data.fill(1.0)
-        # norm adj matrix
         sumArr = A.sum(axis=1)
-        # add epsilon to avoid Devide by zero Warning
+        # Preserve the selected implementation's epsilon and arithmetic order.
         diag = np.asarray(sumArr).reshape(-1) + 1e-7
         diag = np.power(diag, -0.5)
         D = sp.diags(diag)
         L = D.dot(A).dot(D)
-        # covert norm_adj matrix to tensor
-        L = sp.coo_matrix(L)
-        return np.asarray(sumArr), self.scipy_matrix_to_sparse_tenser(
-            L,
-            torch.Size((self.n_nodes, self.n_nodes)),
-        )
-
+        return np.asarray(sumArr), _scipy_to_torch(L, self.device)
 
     def cge(self):
+        """Collaborative encoding, averaged over the input and all graph layers."""
         current = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         layers = [current]
         for _ in range(self.n_ui_layers):
@@ -148,83 +181,164 @@ class LGMRecOpt(GeneralRecommender):
         return torch.stack(layers, dim=1).mean(dim=1)
 
     def mge(self, projected_items):
+        """TRAIN-history user initialization followed by modality propagation."""
         users = torch.sparse.mm(self.adj, projected_items) * self.num_inters[:self.n_users]
         features = torch.cat((users, projected_items), dim=0)
         for _ in range(self.n_mm_layer):
             features = torch.sparse.mm(self.norm_adj, features)
         return features
 
-    def forward(self, return_hyper=False):
+    def forward(self, missing_modality=None, missing_items=None):
+        # Explicit inference-only intervention; ordinary training/VALID is unchanged.
+        if missing_modality is not None:
+            if self.training:
+                raise ValueError('Input-missing diagnosis requires eval mode')
+            if missing_modality not in ('image', 'text', 'both'):
+                raise ValueError('Expected image, text or both')
+            if not isinstance(missing_items, torch.Tensor) or missing_items.dtype != torch.bool or missing_items.shape != (self.n_items,):
+                raise ValueError('Expected one boolean missing flag per catalog item')
+        elif missing_items is not None:
+            raise ValueError('Missing flags require a modality')
+        # 1. Local collaborative and modality representations.
         collaborative = self.cge()
-        visual = torch.mm(self.image_embedding.weight, self.item_image_trs)
+        image_input = self.image_embedding.weight
+        text_input = self.text_embedding.weight
+        if missing_modality is not None:
+            observed = (~missing_items).to(device=image_input.device).unsqueeze(1)
+            if missing_modality in ('image', 'both'):
+                image_input = image_input * observed
+            if missing_modality in ('text', 'both'):
+                text_input = text_input * observed
+        visual = torch.mm(image_input, self.item_image_trs)
         visual_local = self.mge(visual)
-        textual = torch.mm(self.text_embedding.weight, self.item_text_trs)
+        textual = torch.mm(text_input, self.item_text_trs)
         textual_local = self.mge(textual)
         local = collaborative + (F.normalize(visual_local) + F.normalize(textual_local))
+
+        # 2. Modality-weighted anchor hypergraph; values are collaborative items.
         global_views = []
         collaborative_items = collaborative[self.n_users:]
         for features in (visual, textual):
-            items = self.sparse_hypergraph(collaborative_items, features)
+            # Identity keeps the same local/global fusion and history readout;
+            # only the learned group mixing (and its gradient path) is removed.
+            items = (collaborative_items if self.hyper_propagation == 'identity'
+                     else self.sparse_hypergraph(collaborative_items, features))
             users = torch.sparse.mm(self.adj, items) * self.num_inters[:self.n_users]
             global_views.extend((users, items))
         uv, iv, ut, it = global_views
         visual_global = torch.cat((uv, iv), dim=0)
         textual_global = torch.cat((ut, it), dim=0)
         combined = local + self.alpha * F.normalize(visual_global + textual_global)
+
+        # Restore the original behavior branch from raw item IDs, including
+        # its original graph normalization and both user/item contributions.
         users, items = torch.split(combined, [self.n_users, self.n_items], dim=0)
         residual = self.behavior_view(self.item_id_embedding.weight)
         ru, ri = torch.split(residual, [self.n_users, self.n_items], dim=0)
         final_users = users + self.behavior_eta * ru
         final_items = items + self.behavior_eta * ri
-        if return_hyper:
-            return final_users, final_items, iv + it
         return final_users, final_items
 
-    def item_contrastive_loss(self, hyper_items, final_items, item_ids):
-        """MMHCL-inspired one-way SCL adapted to distinct TRAIN-batch items.
+    @torch.no_grad()
+    def diagnose_missing(self, valid_data, expected_valid, mask_seed=20261021):
+        """Fixed-checkpoint VALID audit. Never use during training or model selection.
 
-        Each distinct TRAIN-batch item is one class; its two views are the
-        positive pair, with the final view as anchor. Other item IDs supply
-        final-view and hypergraph-view negatives; final-view self-pairs are
-        excluded. Both views receive gradients, without a reverse loss term.
-        No extra sampling or full-catalog logits are used.
+        Uses catalog-wide nested masks, shared across modalities/checkpoints.
+        Subgroup metrics average users with subgroup targets, retaining full ranks.
         """
-        item_ids = torch.unique(item_ids)
-        if item_ids.numel() < 2:
-            return (hyper_items[item_ids].sum() + final_items[item_ids].sum()) * 0.0
-        hyper = F.normalize(hyper_items[item_ids], dim=1)
-        final = F.normalize(final_items[item_ids], dim=1)
-        cross_logits = (final @ hyper.T) / self.item_cl_temperature
-        same_logits = (final @ final.T) / self.item_cl_temperature
-        same_logits = same_logits.masked_fill(
-            torch.eye(item_ids.numel(), dtype=torch.bool, device=final.device),
-            float('-inf'))
-        log_denominator = torch.logaddexp(
-            torch.logsumexp(same_logits, dim=1),
-            torch.logsumexp(cross_logits, dim=1))
-        return (log_denominator - cross_logits.diagonal()).mean()
+        from utils.topk_evaluator import TopKEvaluator
+        from utils.metrics import recall_, ndcg_
+        if self.training:
+            raise ValueError('Call eval() before diagnosis')
+        if not expected_valid or not all(math.isfinite(float(value)) for value in expected_valid.values()):
+            raise ValueError('Expected finite reference VALID metrics from this checkpoint')
+        config = valid_data.config
+        evaluator = TopKEvaluator(config)
+        permutation = np.random.default_rng(mask_seed).permutation(self.n_items)
+        rows = []
+        positive = valid_data.get_eval_items()
+
+        def group_metrics(top, mask):
+            groups = {}
+            for name, flag in [('missing', True), ('observed', False)]:
+                targets = [set(int(j) for j in items if bool(mask[int(j)]) == flag) for items in positive]
+                selected = [i for i, items in enumerate(targets) if items]
+                values = dict(users=len(selected), targets=sum(len(targets[i]) for i in selected))
+                if selected:
+                    hit = np.asarray([[int(j) in targets[i] for j in top[i]] for i in selected])
+                    lengths = np.asarray([len(targets[i]) for i in selected])
+                    for metric, function in [('recall', recall_), ('ndcg', ndcg_)]:
+                        scores = function(hit, lengths)
+                        values.update({f'{metric}@{k}': float(scores[k-1]) for k in config['topk']})
+                groups[name] = values
+            return groups
+
+        scenarios = [(None, 0.)] + [(modality, ratio)
+                                   for modality in ('image', 'text', 'both') for ratio in (.2, .5)]
+        for modality, ratio in scenarios:
+            mask = np.zeros(self.n_items, dtype=bool)
+            mask[permutation[:int(self.n_items * ratio)]] = True
+            flags = torch.as_tensor(mask, device=self.item_id_embedding.weight.device)
+            users, items = self.forward(modality, flags if modality else None)
+            if not torch.isfinite(users).all() or not torch.isfinite(items).all():
+                raise FloatingPointError('Non-finite diagnostic representations')
+            matrices = []
+            for batch in valid_data:
+                scores = users[batch[0]] @ items.T
+                if not torch.isfinite(scores).all():
+                    raise FloatingPointError('Non-finite diagnostic scores')
+                scores[batch[1][0], batch[1][1]] = -1e10
+                matrices.append(torch.topk(scores, max(config['topk']), dim=-1).indices.cpu())
+            metrics = evaluator.evaluate(matrices, valid_data)
+            if not all(math.isfinite(float(value)) for value in metrics.values()):
+                raise FloatingPointError('Non-finite diagnostic metrics')
+            top = torch.cat(matrices).numpy()
+            if modality is None:
+                if set(metrics) != set(expected_valid) or any(abs(metrics[k]-expected_valid[k]) > 1e-7 for k in metrics):
+                    raise ValueError(f'Complete VALID does not match checkpoint: expected={expected_valid}, actual={metrics}')
+                baseline, complete_top = metrics, top.copy()
+            rows.append(dict(modality=modality or 'complete', ratio=ratio, missing_count=int(mask.sum()),
+                             mask_sha256=hashlib.sha256(mask.tobytes()).hexdigest(), metrics=metrics,
+                             retention={k: metrics[k]/baseline[k] if baseline[k] else None for k in metrics},
+                             groups=group_metrics(top, mask), complete_groups=group_metrics(complete_top, mask),
+                             mean_user_norm=float(users.norm(dim=1).mean()),
+                             mean_item_norm=float(items.norm(dim=1).mean())))
+            getLogger().info('Missing input diagnosis: %s', json.dumps(rows[-1]))
+        return dict(mask_seed=mask_seed, item_permutation=permutation.tolist(), results=rows,
+                    split='VALID', test_evaluated=False, complete_tolerance=1e-7,
+                    task='full-training-missing-inference',
+                    mask_rule='floor(ratio * catalog_size); same nested permutation for image/text/both',
+                    subgroup_rule='macro over users with subgroup targets; full-catalog ranks; subgroup IDCG')
 
     def calculate_loss(self, interaction):
+        """One TRAIN negative per positive; BPR plus the existing norm penalty."""
+        self._eval_embeddings = None
         if interaction.ndim != 2 or interaction.size(0) != 3:
             raise ValueError('Expected one TRAIN negative per positive')
         uid, positive, negative = interaction.long()
-        users, items, hyper_items = self.forward(return_hyper=True)
+        users, items = self.forward()
         u, p, n = users[uid], items[positive], items[negative]
         ranking = self.bpr_loss(u, p, n)
         penalty = self.reg_weight * self.reg_loss(u, p, n)
-        contrast = self.item_contrastive_loss(
-            hyper_items, items, torch.cat((positive, negative)))
-        weighted_contrast = self.item_cl_weight * contrast
         if self.training:
-            for key, value in {'loss_bpr': ranking, 'loss_reg': penalty,
-                               'loss_item_cl_raw': contrast,
-                               'loss_item_cl_weighted': weighted_contrast}.items():
+            for key, value in {'loss_bpr': ranking, 'loss_reg': penalty}.items():
                 self._sums[key] = self._sums.get(key, 0.) + float(value.detach()) * uid.numel()
             self._count += uid.numel()
-        return ranking + penalty + weighted_contrast
+        return ranking + penalty
 
     def full_sort_predict(self, interaction):
-        users, items = self.forward()
+        # Like RecBole LightGCN, compute the full graph once for all user batches.
+        # Direct forward (including missing-input diagnosis) always recomputes.
+        # Call eval() again after manually changing weights or graph settings.
+        cacheable = (not self.training and not torch.is_grad_enabled()
+                     and not torch.is_autocast_enabled(self.item_id_embedding.weight.device.type))
+        if cacheable:
+            if self._eval_embeddings is None:
+                self._eval_embeddings = self.forward()
+            users, items = self._eval_embeddings
+        else:
+            self._eval_embeddings = None
+            users, items = self.forward()
         return users[interaction[0]] @ items.T
 
     def pre_epoch_processing(self):
@@ -240,25 +354,23 @@ class LGMRecOpt(GeneralRecommender):
         bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         return bpr_loss
 
-
     def reg_loss(self, *embs):
+        """Preserve the original sum of unsquared L2 norms divided by batch size."""
         reg_loss = 0
         for emb in embs:
             reg_loss += torch.norm(emb, p=2)
         reg_loss /= embs[-1].shape[0]
         return reg_loss
-
-
-
 MSCA_STRUCT_TOPK = 10
 MSCA_MIN_COOCCURRENCE = 2  # equivalent to the authors' data > 1
 UPSTREAM_SOURCE = 'https://github.com/recomall/MSCA/blob/main/src/models/msca.py'
 
 
 def _canonical_interactions(interaction_matrix):
-    matrix = interaction_matrix.astype(np.float32).tocsr(copy=True)
+    matrix = interaction_matrix.astype(np.float32).copy()
     if not np.isfinite(matrix.data).all() or (matrix.data < 0).any():
         raise ValueError('TRAIN interactions must be finite and non-negative')
+    matrix = matrix.tocsr()
     matrix.sum_duplicates()
     matrix.eliminate_zeros()
     matrix.data[:] = 1  # Count distinct users, not duplicate event frequency.
@@ -266,12 +378,8 @@ def _canonical_interactions(interaction_matrix):
     return matrix
 
 
-def behavior_graph_fingerprint(interaction_matrix, *, topk, minimum,
-                               graph_mode='cooccurrence', graph_seed=0,
-                               self_loop=True, edge_weight='binary', neighbor_score='count'):
+def behavior_graph_fingerprint(interaction_matrix, *, topk, minimum):
     """Identify the exact TRAIN matrix and structural graph parameters."""
-    if neighbor_score != 'count':
-        raise ValueError('neighbor_score=cosine is retired; only count is supported')
     matrix = _canonical_interactions(interaction_matrix)
     digest = hashlib.sha256()
     digest.update(np.asarray(matrix.shape, dtype=np.int64).tobytes())
@@ -279,9 +387,10 @@ def behavior_graph_fingerprint(interaction_matrix, *, topk, minimum,
     digest.update(matrix.indices.astype(np.int64, copy=False).tobytes())
     digest.update(matrix.data.astype(np.float32, copy=False).tobytes())
     digest.update(np.asarray([topk, minimum], dtype=np.int64).tobytes())
-    digest.update(json.dumps(dict(version=2, graph_mode=graph_mode,
-        graph_seed=graph_seed if graph_mode == 'random_relabel' else None,
-        self_loop=self_loop, edge_weight=edge_weight), sort_keys=True).encode())
+    # Restore the original encoder graph schema; construction uses no seed.
+    digest.update(json.dumps(dict(version=2, graph_mode='cooccurrence',
+        graph_seed=None, self_loop=True, edge_weight='binary'),
+        sort_keys=True).encode())
     return digest.hexdigest()
 
 
@@ -295,7 +404,7 @@ def _scipy_to_torch(matrix, device):
 
 
 def build_normalized_interactions(interaction_matrix, device):
-    """Build MSCA's D_u^-1/2 R D_i^-1/2 from TRAIN interactions."""
+    """Build MSCA's D_u^-1/2 R D_i^-1/2 from binary TRAIN interactions."""
     matrix = _canonical_interactions(interaction_matrix)
     user_degree = np.asarray(matrix.sum(axis=1)).reshape(-1)
     item_degree = np.asarray(matrix.sum(axis=0)).reshape(-1)
@@ -303,16 +412,12 @@ def build_normalized_interactions(interaction_matrix, device):
     item_scale = np.zeros_like(item_degree, dtype=np.float32)
     np.power(user_degree, -0.5, out=user_scale, where=user_degree > 0)
     np.power(item_degree, -0.5, out=item_scale, where=item_degree > 0)
-    normalized = sp.diags(user_scale).dot(matrix).dot(
-        sp.diags(item_scale)
-    )
+    normalized = sp.diags(user_scale).dot(matrix).dot(sp.diags(item_scale))
     return _scipy_to_torch(normalized, device)
 
 
 def build_structural_adjacency(interaction_matrix, *, topk, minimum,
-                               device, graph_mode='cooccurrence', graph_seed=0,
-                               self_loop=True, edge_weight='binary', block_size=1024,
-                               neighbor_score='count'):
+                               device, block_size=1024):
     """Directed row-TopK graph; blockwise product bounds temporary row count.
 
     The selected method uses binary cooccurrence edges and self membership.
@@ -320,14 +425,6 @@ def build_structural_adjacency(interaction_matrix, *, topk, minimum,
     for name, value in [('topk', topk), ('minimum', minimum), ('block_size', block_size)]:
         if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
             raise ValueError(f'{name} must be a positive integer')
-    if graph_mode != 'cooccurrence':
-        raise ValueError('Only the selected cooccurrence graph is supported')
-    if neighbor_score != 'count':
-        raise ValueError('neighbor_score=cosine is retired; only count is supported')
-    if edge_weight != 'binary' or self_loop is not True:
-        raise ValueError('Invalid edge_weight or self_loop')
-    if isinstance(graph_seed, bool) or not isinstance(graph_seed, Integral) or graph_seed < 0:
-        raise ValueError('graph_seed must be a non-negative integer')
     interactions = _canonical_interactions(interaction_matrix)
     n_items = interactions.shape[1]
     rows, columns, weights = [], [], []
@@ -347,10 +444,9 @@ def build_structural_adjacency(interaction_matrix, *, topk, minimum,
             columns.extend(selected.tolist())
             weights.extend([1.] * len(selected))
 
-    if self_loop:
-        rows.extend(range(n_items))
-        columns.extend(range(n_items))
-        weights.extend([1.] * n_items)
+    rows.extend(range(n_items))
+    columns.extend(range(n_items))
+    weights.extend([1.] * n_items)
 
     rows = np.asarray(rows, dtype=np.int64)
     columns = np.asarray(columns, dtype=np.int64)
@@ -367,20 +463,16 @@ def build_structural_adjacency(interaction_matrix, *, topk, minimum,
 
 
 class MSCABehaviorView(nn.Module):
-    """Parameter-free MSCA structural encoder cached from one TRAIN graph."""
+    """Original parameter-free behavior encoder and anchor membership support."""
 
     def __init__(self, interaction_matrix, device, *,
                  topk=MSCA_STRUCT_TOPK,
-                 minimum=MSCA_MIN_COOCCURRENCE, graph_mode='cooccurrence',
-                 graph_seed=0, self_loop=True, edge_weight='binary', block_size=1024,
-                 neighbor_score='count'):
+                 minimum=MSCA_MIN_COOCCURRENCE, block_size=1024):
         super().__init__()
         self.topk = topk
         self.minimum = minimum
-        options = dict(graph_mode=graph_mode, graph_seed=graph_seed,
-                       self_loop=self_loop, edge_weight=edge_weight, neighbor_score=neighbor_score)
         self.cache_fingerprint = behavior_graph_fingerprint(
-            interaction_matrix, topk=self.topk, minimum=self.minimum, **options
+            interaction_matrix, topk=self.topk, minimum=self.minimum
         )
         # Rebuild from the current TRAIN matrix on every model construction.
         # Non-persistent buffers prevent a checkpoint from replacing this
@@ -389,12 +481,14 @@ class MSCABehaviorView(nn.Module):
             'structural_adjacency',
             build_structural_adjacency(
                 interaction_matrix, topk=self.topk,
-                minimum=self.minimum, device=device, block_size=block_size, **options
+                minimum=self.minimum, device=device, block_size=block_size
             ),
             persistent=False,
         )
         self.metadata = dict(fingerprint=self.cache_fingerprint, topk=topk,
-                             minimum=minimum, **options,
+                             minimum=minimum, graph_mode='cooccurrence', graph_seed=None,
+                             self_loop=True, edge_weight='binary', neighbor_score='count',
+                             role='behavior_encoder_and_hypergraph_support', output_branch=True,
                              normalized_nonzero_edges=self.structural_adjacency._nnz())
         self.register_buffer(
             'normalized_interactions',
@@ -413,6 +507,7 @@ class MSCABehaviorView(nn.Module):
 
 
 class SparseGroupHypergraph(nn.Module):
+    """Shared fixed members, modality-conditioned weights, and two-way propagation."""
     def __init__(self, structural_adjacency, *, layers=1):
         super().__init__()
         if isinstance(layers, bool) or not isinstance(layers, Integral) or layers < 1:
@@ -459,14 +554,6 @@ class SparseGroupHypergraph(nn.Module):
 
     def weights(self, item_embeddings, projected_features):
         """Return [anchor, padded member] coefficients; padded entries are zero."""
-        for name, value in (('item_embeddings', item_embeddings),
-                            ('projected_features', projected_features)):
-            if value.ndim != 2 or value.shape[0] != self.n_items or value.shape[1] < 1:
-                raise ValueError(f'{name} must be a nonempty item feature matrix')
-            if value.device != self.members.device or not value.is_floating_point():
-                raise ValueError(f'{name} must be floating point on the graph device')
-        if item_embeddings.dtype != projected_features.dtype:
-            raise ValueError('Item embeddings and projected features must share dtype')
         features = F.normalize(projected_features, dim=1)
         gathered = features[self.members]
         query = features
@@ -489,3 +576,104 @@ class SparseGroupHypergraph(nn.Module):
             current = torch.zeros_like(current).index_add_(0, self._item_ids, messages)
             current = current / mass.clamp_min(torch.finfo(current.dtype).tiny)[:, None]
         return current
+
+
+def _run_missing_diagnosis():
+    """Model-local command: python -m models.LGMRecopt --checkpoint PATH."""
+    import argparse
+    import csv
+    from datetime import datetime
+    from pathlib import Path
+    from uuid import uuid4
+    from utils.configurator import Config
+    from utils.dataset import RecDataset
+    from utils.dataloader import TrainDataLoader, EvalDataLoader
+    from utils.experiment_state import fingerprint_inputs, runtime_metadata
+    from utils.utils import init_seed
+
+    parser = argparse.ArgumentParser(description='Research-1 checkpoint: VALID input-missing diagnosis only')
+    parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--data-dir', type=Path, default=Path('data'))
+    parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--mask-seed', type=int, default=20261021)
+    args = parser.parse_args()
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
+    source = saved['config']
+    expected_version = f'{IMPLEMENTATION_VERSION}-group'
+    if saved.get('model') != 'LGMRecOpt' or saved.get('implementation_version') != expected_version:
+        raise ValueError(f'Requires {expected_version} weights; historical checkpoints need their historical source')
+    if saved.get('protocol') != 'train_only' or source.get('report_test') is not False:
+        raise ValueError('Requires a TRAIN-only VALID-selected checkpoint')
+    if os.environ.get('LGMRECOPT_HYPER_PROPAGATION', 'group') != 'group':
+        raise ValueError('Unset LGMRECOPT_HYPER_PROPAGATION or set it to group')
+    config = Config('LGMRecOpt', saved['dataset'])
+    for key in list(config.final_config_dict):
+        if key in source:
+            config[key] = source[key]
+    config['data_path'] = str(args.data_dir.resolve()) + os.sep
+    config['device'] = torch.device(f'cuda:{args.gpu}' if source.get('use_gpu', True) and torch.cuda.is_available() else 'cpu')
+    config['gpu_id'] = args.gpu
+    config['save_recommended_topk'] = False
+    hashes, signature = fingerprint_inputs(config)
+    if signature != source.get('data_signature'):
+        raise ValueError('Checkpoint and input data fingerprints differ')
+    init_seed(int(config['seed']))
+    train, valid, _ = RecDataset(config).split()
+    train_data = TrainDataLoader(config, train, batch_size=config['train_batch_size'], shuffle=False)
+    valid_data = EvalDataLoader(config, valid, additional_dataset=train, batch_size=config['eval_batch_size'])
+    model = LGMRecOpt(config, train_data).to(config['device'])
+    for key, features in [('image_embedding.weight', model.image_embedding.weight),
+                          ('text_embedding.weight', model.text_embedding.weight)]:
+        if not torch.equal(saved['model_state_dict'][key].cpu(), features.detach().cpu()):
+            raise ValueError('Checkpoint contains modified input features: ' + key)
+    model.load_state_dict(saved['model_state_dict'], strict=True)
+    model.eval()
+    output = (args.output_dir or Path('log') / (
+        f'missing-LGMRecOpt-seed{config["seed"]}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}')).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    metadata = dict(checkpoint=str(args.checkpoint.resolve()),
+                    checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
+                    checkpoint_version=saved['implementation_version'], epoch=saved['epoch'],
+                    seed=int(config['seed']), data_signature=signature, input_hashes=hashes,
+                    runtime=runtime_metadata(config['device']), finished=False)
+    try:
+        report = model.diagnose_missing(valid_data, saved['best_valid_result'], args.mask_seed)
+        report.update(metadata)
+        np.save(output / 'item-permutation.npy', np.asarray(report.pop('item_permutation'), dtype=np.int64))
+        with (output / 'metrics.csv').open('w', newline='', encoding='utf-8-sig') as handle:
+            keys = list(report['results'][0]['metrics'])
+            writer = csv.DictWriter(handle, fieldnames=['modality', 'ratio', 'missing_count'] + keys + ['retention_'+k for k in keys])
+            writer.writeheader()
+            for row in report['results']:
+                writer.writerow({**{k: row[k] for k in ['modality', 'ratio', 'missing_count']}, **row['metrics'],
+                                 **{'retention_'+k: v for k, v in row['retention'].items()}})
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
+        for axis, metric in zip(axes, ['recall@20', 'ndcg@20']):
+            for modality in ['image', 'text', 'both']:
+                rows = [report['results'][0]] + [r for r in report['results'] if r['modality'] == modality]
+                axis.plot([r['ratio'] for r in rows], [r['metrics'][metric] for r in rows], marker='o', label=modality)
+            axis.set(xlabel='Missing item fraction', ylabel=metric, title=f'Seed {config["seed"]}')
+            axis.legend()
+            axis.grid(alpha=.25)
+        fig.tight_layout()
+        fig.savefig(output / 'sensitivity.png', dpi=180)
+        fig.savefig(output / 'sensitivity.svg')
+        plt.close(fig)
+        report['finished'] = True
+        (output / 'results.json').write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+        for row in report['results']:
+            print(row['modality'], row['ratio'], row['metrics'])
+        print('VALID diagnosis saved:', output)
+    except Exception as exc:
+        metadata['error'] = str(exc)
+        (output / 'failure.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+        raise
+
+
+if __name__ == '__main__':
+    _run_missing_diagnosis()

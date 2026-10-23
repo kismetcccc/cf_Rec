@@ -1,5 +1,5 @@
 # Selected sparse_anchor_nohcl; no alternate algorithms.
-implementation_version: lgmrec-opt-standalone-anchor-v1
+implementation_version: lgmrec-opt-train-canonical-v3
 embedding_size: 64
 feat_embed_dim: 64
 behavior_eta: 0.2

@@ -117,7 +117,6 @@ class TrainDataLoader(AbstractDataLoader):
         self.all_item_len = len(self.all_items)
         # if full sampling
         self.use_full_sampling = config['use_full_sampling']
-        self.negative_candidate_num = 1
 
         if config['use_neg_sampling']:
             if self.use_full_sampling:
@@ -224,10 +223,9 @@ class TrainDataLoader(AbstractDataLoader):
         batch_tensor = torch.cat((torch.unsqueeze(user_tensor, 0),
                                   torch.unsqueeze(item_tensor, 0)))
         u_ids = cur_data[self.config['USER_ID_FIELD']]
-        # sampling negative items only in the dataset (train)
+        # Uniform negatives from the configured catalog, excluding TRAIN history.
         neg_ids = self._sample_neg_ids(u_ids).to(self.device)
-        negative_rows = neg_ids.unsqueeze(0) if neg_ids.dim() == 1 else neg_ids.transpose(0, 1)
-        batch_tensor = torch.cat((batch_tensor, negative_rows))
+        batch_tensor = torch.cat((batch_tensor, neg_ids.unsqueeze(0)))
 
         return batch_tensor
 
@@ -247,27 +245,6 @@ class TrainDataLoader(AbstractDataLoader):
         return user_tensor
 
     def _sample_neg_ids(self, u_ids):
-        if self.negative_candidate_num > 1:
-            candidate_rows = []
-            for user in u_ids:
-                known_items = self.history_items_per_u[user]
-                selected = []
-                selected_set = set()
-                enough_unique = (
-                    self.all_item_len - len(known_items)
-                    >= self.negative_candidate_num
-                )
-                while len(selected) < self.negative_candidate_num:
-                    item = random.choice(self.all_items)
-                    if item in known_items or (
-                        enough_unique and item in selected_set
-                    ):
-                        continue
-                    selected.append(item)
-                    selected_set.add(item)
-                candidate_rows.append(selected)
-            return torch.tensor(candidate_rows).type(torch.LongTensor)
-
         neg_ids = []
         for u in u_ids:
             # random 1 item

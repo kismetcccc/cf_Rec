@@ -33,7 +33,7 @@ def _best_result_index(hyper_results, metric):
     )
 
 
-def _prepare_train_only_protocol(train_data, train_dataset, negative_count=1):
+def _prepare_train_only_protocol(train_data, train_dataset):
     """Uniform full-catalog negatives, excluding ONLY observed train positives."""
     item_count = train_dataset.get_item_num()
     history = {
@@ -46,10 +46,6 @@ def _prepare_train_only_protocol(train_data, train_dataset, negative_count=1):
     train_data.all_items = list(range(item_count))
     train_data.all_items_set = set(train_data.all_items)
     train_data.all_item_len = item_count
-    negative_count = int(negative_count)
-    if negative_count < 1:
-        raise ValueError('negative_count must be positive')
-    train_data.negative_candidate_num = negative_count
 
 
 def quick_start(model, dataset, config_dict, save_model=False, initialize_logger=True):
@@ -81,8 +77,8 @@ def quick_start(model, dataset, config_dict, save_model=False, initialize_logger
     test_history_dataset = train_dataset
     protocol = config['protocol']
     if protocol == 'train_only':
-        # All current variants use the baseline TRAIN-only single-negative sampler.
-        _prepare_train_only_protocol(train_data, train_dataset, 1)
+        # Both models use the baseline TRAIN-only single-negative sampler.
+        _prepare_train_only_protocol(train_data, train_dataset)
         test_history_dataset = train_dataset.copy(pd.concat(
             [train_dataset.df, valid_dataset.df], ignore_index=True, sort=False))
     (valid_data, test_data) = (

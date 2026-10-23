@@ -11,7 +11,7 @@ cf_Rec/
   configs/model/           两个模型各自的配置
   configs/overall.yaml     公共训练设置
   data/                    数据位置，初始为空
-  img/                     官方布局占位
+  img/                     论文框架图
   log/                     新运行产物
   models/LGMRec.py          原始基线
   models/LGMRecopt.py       独立优化模型及内部算子
@@ -22,13 +22,45 @@ cf_Rec/
   README.md
 ```
 
-models/ 严格只有上述两个 Python 文件。历史实验、备份、测试、虚拟环境均留在原仓库。
+models/ 严格只有上述两个 Python 文件。当前发布为 `lgmrec-opt-train-canonical-v3-group`。历史实验日志、数据与检查点保留在本地，不随源码发布。
 
-## 唯一优化方案
+## 当前实现与阅读顺序
 
 LGMRecOpt 固定为 `sparse_anchor_nohcl`：LightGCN 协同编码 + 图文局部编码 + TRAIN 锚点群组超图 + 双侧行为残差。损失仅 BPR + 正则。无原型分配、Gumbel、HCL、history、id_cond 或 C0 切换。
 
-按已有 Baby 同轮三种子 VALID Recall@20 主指标选择：
+`models/LGMRecopt.py` 按以下顺序阅读：
+
+1. `cge` / `mge`：协同表示和两路图文局部表示。
+2. `forward`：局部融合 → 图文加权的锚点超图 → 原始物品 ID 的行为残差。图文特征决定超图权重，超图传播值来自协同物品表示；行为分支不新增可训练参数。
+3. `calculate_loss`：单个 TRAIN 均匀负样本对应的 BPR + 原有表示正则。
+4. 文件下半部分的构图函数、`MSCABehaviorView` 和 `SparseGroupHypergraph`：上述模型使用的内部算子，不是其他模型。
+
+默认执行 `group`。环境变量 `LGMRECOPT_HYPER_PROPAGATION=identity` 仅用于已有传播诊断，保留同一主体的其他计算和行为残差；不能把这个对照当成关闭行为残差。两个模式使用相同 TRAIN 图和参数集合。
+
+当前版本恢复原有效行为残差，`behavior_eta=0.2`；所有图和用户读出共用去重、二值化的 TRAIN 交互，分别保留各算子的原归一化。超图消息值仍为 CGE 物品表示。没有新增残差、门控或训练目标，物品对比损失关闭且不再计算。
+
+完整输入评估使用单次 eval 内的表示缓存；重新 eval/train、设备或精度迁移、加载权重与训练损失计算会清空缓存。手动修改参数、图或融合系数后应重新调用 eval()。`init_reference_width` 只消耗历史初始化随机数以保留种子轨迹，不产生可训练参数。
+
+第二项研究目前是模型文件内的推理模态缺失诊断：固定检查点，对 VALID 进行缺图、缺文本或图文均缺的输入干预。它不参与训练和选模，不能表述为已实现缺失感知训练。训练继续使用单个 TRAIN 均匀负样本。
+
+发布范围、源码哈希、验证与限制见 [本次发布记录](docs/20261023-180404-改动说明.md)。
+
+## 历史最好结果：Baby，固定 200 轮
+
+以下为历史 `lgmrec-opt-hyper-contribution-ab-v1-group` 无 CL 实验，种子 999/2026/2027；epochs=200、stopping_step=200、eval_step=1，按 VALID Recall@20 选取同一轮的全部指标。它们是保留当前主体结构的历史依据，**不是本次上传重新跑出的成绩**，也不是 TEST 结果。
+
+| seed | 最佳 epoch（从 0 起） | Recall@10 | Recall@20 | Recall@50 | NDCG@10 | NDCG@20 | NDCG@50 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 999 | 173 | 0.064168044 | 0.103491961 | 0.166504243 | 0.034639235 | 0.044653754 | 0.057225606 |
+| 2026 | 101 | 0.065504292 | 0.103030342 | 0.167027374 | 0.035010302 | 0.044577901 | 0.057380594 |
+| 2027 | 154 | 0.065006367 | 0.102121797 | 0.167468890 | 0.035014974 | 0.044452126 | 0.057492412 |
+| 均值 | — | 0.064892901 | **0.102881367** | 0.167000169 | 0.034888170 | **0.044561260** | 0.057366204 |
+
+本次上传的是恢复该主体结构并保留构图修复的 v3 源码，没有附带历史最佳 200 轮权重；该组原日志未保存检查点。当前 v3 的真实 Baby seed999 20 轮验证为 Recall@20=0.098277621、NDCG@20=0.042661066，最佳 epoch=18；严格重载检查点后 VALID 指标一致。当前源码尚未重新完成 200 轮三种子，Sports/Clothing 也没有同等完整效果证据。
+
+## 更早的独立实验记录
+
+下表保留较早一轮 Baby 三种子结果；其训练预算与上面的固定 200 轮不同，不能跨表直接比较提升幅度。该轮按 VALID Recall@20 选择：
 
 | 方案 | R20 | N20 | R50 |
 |---|---:|---:|---:|
@@ -41,7 +73,9 @@ LGMRecOpt 固定为 `sparse_anchor_nohcl`：LightGCN 协同编码 + 图文局部
 
 ## 安装与运行
 
-Python >=3.10，使用合适的 PyTorch/CUDA 环境：
+当前发布的已验证环境为 Python 3.12.7、PyTorch 2.6.0+cu124、NumPy 1.26.4、SciPy 1.13.1。请使用对应的 PyTorch 2.6.0 环境及适配硬件的构建。
+
+已知限制：`requirement.txt` 的历史宽范围仍允许 torch 2.2，但当前缓存调用的 `torch.is_autocast_enabled(device_type)` 不兼容 2.2 的无参数接口；因此不能仅满足该依赖下限就视为可运行。本次按原样发布模型，未修改依赖或该接口。
 
 ```bash
 pip install -r requirement.txt
@@ -67,9 +101,9 @@ python main.py -m LGMRecOpt -d baby --seed 999 --data-dir "D:\project_sum\result
 
 优化模型不再保存旧 v_hyper/t_hyper 参数，旧检查点不能直接 strict 加载；历史审计留在原仓库。init_reference_width 仅消耗历史原型初始化对应的随机数，使保留权重和后续 RNG 与选定版本一致，不产生参数或超边，不是新调参项。
 
-三种子微型数据对照通过：初始化、RNG、损失、梯度、两步带 weight decay 的 Adam 更新和推理结果与旧锚点候选精确一致。两模型均通过独立 CLI 单轮合成训练和检查点保存；验证文件在原目录 test_runtime/standalone-anchor-2e6569a8。
+历史独立实现审计中，三种子微型数据对照通过：初始化、RNG、损失、梯度、两步带 weight decay 的 Adam 更新和推理结果与旧锚点候选精确一致。两模型均通过独立 CLI 单轮合成训练和检查点保存；验证文件在原目录 test_runtime/standalone-anchor-2e6569a8。
 
-仅 TRAIN 构图、负采样、学习；VALID 选模；训练 CLI 不开放 TEST。TEST 只在最终冻结后评估一次。本次未运行新的完整实验或真实 TEST。
+仅 TRAIN 构图、负采样、学习；VALID 选模；训练 CLI 不开放 TEST。TEST 只在最终冻结后评估一次。本次上传只做只读核验，没有重新训练或评估 TEST。当前 v3 的验证范围及既有 20 轮结果见上述发布记录。
 
 原始材料无可确认的根 LICENSE；整理不新增或改变上游授权，算法出处保留在代码。新目录运行不依赖原仓库 Python 包。
 
