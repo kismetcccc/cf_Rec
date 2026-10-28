@@ -1,5 +1,12 @@
 # Selected sparse_anchor_nohcl; no alternate algorithms.
-implementation_version: lgmrec-opt-train-canonical-v3
+implementation_version: lgmrec-opt-masked-neighbor-v1
+# Module 2: item-wise independent modality masks, refreshed once per epoch.
+# A/C: modality_mask_rate=0; B: neighbor_imputation=false; D: defaults.
+modality_mask_rate: 0.3
+neighbor_imputation: true
+missing_diagnostics: true
+missing_eval_interval: 5
+missing_eval_seed: 20261021
 embedding_size: 64
 feat_embed_dim: 64
 behavior_eta: 0.2

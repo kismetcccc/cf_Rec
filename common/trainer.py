@@ -2,11 +2,11 @@
 
 import os
 import itertools
+import json
 import torch
 import torch.optim as optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
 import numpy as np
-import matplotlib.pyplot as plt
 
 from time import time
 from logging import getLogger
@@ -97,7 +97,6 @@ class Trainer(AbstractTrainer):
         self.best_valid_score = -1
         self.best_valid_result = tmp_dd
         self.best_test_upon_valid = tmp_dd
-        self.train_loss_dict = dict()
         self.optimizer = self._build_optimizer()
 
         #fac = lambda epoch: 0.96 ** (epoch / 50)
@@ -149,11 +148,10 @@ class Trainer(AbstractTrainer):
             tuple which includes the sum of loss in each part.
         """
         if not self.req_training:
-            return 0.0, []
+            return 0.0
         self.model.train()
         loss_func = loss_func or self.model.calculate_loss
         total_loss = None
-        loss_batches = []
         for batch_idx, interaction in enumerate(train_data):
             self.optimizer.zero_grad()
             losses = loss_func(interaction)
@@ -172,11 +170,7 @@ class Trainer(AbstractTrainer):
             if self.clip_grad_norm:
                 clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
             self.optimizer.step()
-            loss_batches.append(loss.detach())
-            # for test
-            #if batch_idx == 0:
-            #    break
-        return total_loss, loss_batches
+        return total_loss
 
     def _valid_epoch(self, valid_data):
         r"""Valid the model with valid data
@@ -220,12 +214,9 @@ class Trainer(AbstractTrainer):
             # train
             training_start_time = time()
             self.model.pre_epoch_processing()
-            train_loss, _ = self._train_epoch(train_data, epoch_idx)
-            #for param_group in self.optimizer.param_groups:
-            #    print('======lr: ', param_group['lr'])
+            train_loss = self._train_epoch(train_data, epoch_idx)
             self.lr_scheduler.step()
 
-            self.train_loss_dict[epoch_idx] = sum(train_loss) if isinstance(train_loss, tuple) else train_loss
             training_end_time = time()
             train_loss_output = \
                 self._generate_train_loss_output(epoch_idx, training_start_time, training_end_time, train_loss)
@@ -238,6 +229,8 @@ class Trainer(AbstractTrainer):
 
             # Select checkpoints from validation only. Test is evaluated once
             # after the best validation state has been restored.
+            stop_flag = False
+            valid_result = None
             if should_evaluate:
                 valid_start_time = time()
                 valid_score, valid_result = self._valid_epoch(valid_data)
@@ -268,8 +261,32 @@ class Trainer(AbstractTrainer):
                     if saved:
                         self._save_checkpoint(best_model_state, best_epoch_idx)
 
-                if stop_flag:
-                    break
+            # Fixed VALID interventions are descriptive curves only. Neither
+            # early stopping nor the retained best state uses these results.
+            # Its cadence is independent of the complete-VALID selection cadence.
+            interval = self.config['missing_eval_interval']
+            if (self.config['missing_diagnostics'] is True and interval
+                    and (epoch_idx + 1) % interval == 0
+                    and self.config['model'] == 'LGMRecOpt'):
+                diagnosis_start = time()
+                if valid_result is None:
+                    _, valid_result = self._valid_epoch(valid_data)
+                # A's curve uses zero filling; C reuses A only at final diagnosis.
+                mode = ('neighbor' if self.model.neighbor_imputation
+                        and self.model.modality_mask_rate > 0 else 'zero')
+                curve = self.evaluator.diagnose_missing(
+                    self.model, valid_data, valid_result, self.config['missing_eval_seed'],
+                    imputation_modes=(mode,), include_groups=False)
+                self.logger.info('Missing VALID curve: %s', json.dumps({
+                    'epoch': epoch_idx, 'state_origin': 'current_epoch',
+                    'used_for_selection': False, 'mask_seed': curve['mask_seed'],
+                    'results': [{key: row[key] for key in ('modality', 'ratio', 'imputation', 'metrics')}
+                                for row in curve['results']],
+                    'seconds': time() - diagnosis_start,
+                }, allow_nan=False))
+
+            if stop_flag:
+                break
 
         if best_model_state is not None:
             self.best_model_state = best_model_state
@@ -345,42 +362,6 @@ class Trainer(AbstractTrainer):
 
     @torch.no_grad()
     def evaluate(self, eval_data, is_test=False, idx=0):
-        r"""Evaluate the model based on the eval data.
-        Returns:
-            dict: eval result, key is the eval metric and value in the corresponding metric value
-        """
         self.model.eval()
-
-        # batch full users
-        batch_matrix_list = []
-        for batch_idx, batched_data in enumerate(eval_data):
-            # predict: interaction without item ids
-            scores = self.model.full_sort_predict(batched_data)
-            masked_items = batched_data[1]
-            # mask out pos items
-            scores[masked_items[0], masked_items[1]] = -1e10
-            # rank and get top-k
-            _, topk_index = torch.topk(scores, max(self.config['topk']), dim=-1)  # nusers x topk
-            batch_matrix_list.append(topk_index)
-        return self.evaluator.evaluate(batch_matrix_list, eval_data, is_test=is_test, idx=idx)
-
-    def plot_train_loss(self, show=True, save_path=None):
-        r"""Plot the train loss in each epoch
-
-        Args:
-            show (bool, optional): whether to show this figure, default: True
-            save_path (str, optional): the data path to save the figure, default: None.
-                                       If it's None, it will not be saved.
-        """
-        epochs = list(self.train_loss_dict.keys())
-        epochs.sort()
-        values = [float(self.train_loss_dict[epoch]) for epoch in epochs]
-        plt.plot(epochs, values)
-        plt.xticks(epochs)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        if show:
-            plt.show()
-        if save_path:
-            plt.savefig(save_path)
-
+        batches = self.evaluator.rank(self.model, eval_data)
+        return self.evaluator.evaluate(batches, eval_data, is_test=is_test, idx=idx)

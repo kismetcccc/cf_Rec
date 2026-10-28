@@ -10,6 +10,7 @@ from utils.configurator import Config
 from utils.experiment_state import fingerprint_inputs
 from utils.utils import init_seed, get_model, get_trainer, dict2str
 import platform
+import json
 import os
 import torch
 
@@ -229,6 +230,40 @@ def quick_start(model, dataset, config_dict, save_model=False, initialize_logger
         logger.info('validation-only run complete; test was not evaluated')
     final_trainer = selected_trainer if grid_search else trainer
     final_model = selected_model if grid_search else model
+    missing_diagnosis = None
+    if config['missing_diagnostics'] is True and config['model'] == 'LGMRecOpt':
+        from datetime import datetime
+        from pathlib import Path
+        from uuid import uuid4
+        from utils.experiment_state import runtime_metadata
+
+        # fit() restored the VALID-best state even with disk checkpoints disabled.
+        # For a grid, this runs only after the complete-VALID winner is selected.
+        final_model.eval()
+        selected_epoch = selected_epoch if grid_search else trainer.best_epoch_idx
+        report = final_trainer.evaluator.diagnose_missing(
+            final_model, valid_data, hyper_ret[best_result_idx][1], config['missing_eval_seed'])
+        report.update(
+            state_origin='in_memory_valid_best', epoch=selected_epoch,
+            seed=int(config['seed']), checkpoint=getattr(final_trainer, 'saved_model_file', None),
+            implementation_version=final_model.implementation_version,
+            data_signature=config['data_signature'], input_hashes=config['input_hashes'],
+            runtime=runtime_metadata(config['device']),
+            effective_config={k: str(v) if isinstance(v, torch.device) else v
+                              for k, v in config.final_config_dict.items()},
+            selection_metric=val_metric, used_for_selection=False,
+        )
+        output = Path(config['log_dir']) / (
+            f'missing-{config["model"]}-{config["dataset"]}-seed{config["seed"]}-'
+            f'{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}')
+        output.mkdir(parents=True, exist_ok=False)
+        with (output / 'results.json').open('x', encoding='utf-8') as handle:
+            json.dump(dict(report, finished=True), handle, ensure_ascii=False, indent=2, allow_nan=False)
+        missing_diagnosis = dict(
+            output_dir=str(output.resolve()), state_origin='in_memory_valid_best',
+            epoch=selected_epoch, mask_seed=config['missing_eval_seed'],
+            used_for_selection=False, report_file=str((output / 'results.json').resolve()))
+        logger.info('VALID missing diagnosis saved: %s', output.resolve())
     behavior_view = getattr(final_model, 'behavior_view', None)
     sparse_hypergraph = getattr(final_model, 'sparse_hypergraph', None)
     return {'valid_result': hyper_ret[best_result_idx][1],
@@ -240,6 +275,5 @@ def quick_start(model, dataset, config_dict, save_model=False, initialize_logger
             'checkpoint': getattr(final_trainer, 'saved_model_file', None),
             'data_signature': config['data_signature'],
             'implementation_version': config['implementation_version'],
+            'missing_diagnosis': missing_diagnosis,
             'test_evaluated': report_test}
-    
-

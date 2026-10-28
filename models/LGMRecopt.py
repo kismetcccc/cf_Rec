@@ -19,12 +19,12 @@ from torch.nn import functional as F
 
 from common.abstract_recommender import GeneralRecommender
 
-IMPLEMENTATION_VERSION = 'lgmrec-opt-train-canonical-v3'
-ARCHITECTURE_REVISION = 3
+IMPLEMENTATION_VERSION = 'lgmrec-opt-masked-neighbor-v1'
+ARCHITECTURE_REVISION = 6
 
 
 class LGMRecOpt(GeneralRecommender):
-    """Anchor hypergraph with an identity-propagation diagnostic control.
+    """Behavior-anchored recommendation with masked-input neighbor completion.
 
     Algorithmically derived from LGMRec and MSCA-style behavior propagation;
     no dependency on the LGMRec model class and no alternate model branches.
@@ -35,17 +35,28 @@ class LGMRecOpt(GeneralRecommender):
         # Complete-input representations shared only within an evaluation pass.
         # Plain attributes: neither checkpoint state nor trainable structure.
         self._eval_embeddings = None
+        self._train_inputs = None
+        self._mask_epoch = -1
+        self._sums, self._count = {}, 0
+        settings = getattr(config, 'final_config_dict', config)
+        mask_rate = settings.get('modality_mask_rate')
+        if isinstance(mask_rate, bool):
+            raise ValueError('modality_mask_rate must be a probability, not a boolean')
+        self.modality_mask_rate = float(mask_rate) if mask_rate is not None else 0.0
+        imputation = settings.get('neighbor_imputation')
+        self.neighbor_imputation = imputation if imputation is not None else False
+        self._mask_seed = int(settings.get('seed') or 0)
+        if not math.isfinite(self.modality_mask_rate) or not 0 <= self.modality_mask_rate <= 1:
+            raise ValueError('modality_mask_rate must be finite and between 0 and 1')
+        if not isinstance(self.neighbor_imputation, bool):
+            raise ValueError('neighbor_imputation must be boolean')
         if config['protocol'] != 'train_only':
             raise ValueError('Only train_only is supported')
-        # Read once per model; explicit per-command settings keep paired runs clear.
-        self.hyper_propagation = os.environ.get('LGMRECOPT_HYPER_PROPAGATION', 'group')
-        if self.hyper_propagation not in ('group', 'identity'):
-            raise ValueError('LGMRECOPT_HYPER_PROPAGATION must be group or identity')
-        self.implementation_version = f'{IMPLEMENTATION_VERSION}-{self.hyper_propagation}'
+        if os.environ.get('LGMRECOPT_HYPER_PROPAGATION', 'group') != 'group':
+            raise ValueError('Legacy hypergraph controls were removed; unset LGMRECOPT_HYPER_PROPAGATION')
+        self.implementation_version = f'{IMPLEMENTATION_VERSION}-group'
         config['implementation_version'] = self.implementation_version
-        config['hyper_propagation'] = self.hyper_propagation
-        # Separate restored behavior propagation from the intermediate version
-        # that omitted it; equal parameter shapes do not imply equal computation.
+        # Parameter shapes alone do not identify the training/input semantics.
         self.register_buffer('_architecture_revision', torch.tensor(ARCHITECTURE_REVISION, dtype=torch.int64))
         self.embedding_dim = config['embedding_size']
         self.feat_embed_dim = config['feat_embed_dim']
@@ -104,47 +115,32 @@ class LGMRecOpt(GeneralRecommender):
             minimum=config['behavior_minimum'], block_size=config['behavior_block_size'])
         self.sparse_hypergraph = SparseGroupHypergraph(
             self.behavior_view.structural_adjacency, layers=self.n_hyper_layer)
+        # Same directed TRAIN membership support, with binary values and no self.
+        # The behavior encoder and hypergraph retain their original self edges.
+        support = self.behavior_view.structural_adjacency.coalesce()
+        indices = support.indices()
+        nonself = indices[0] != indices[1]
+        self.register_buffer('_imputation_support', torch.sparse_coo_tensor(
+            indices[:, nonself], torch.ones_like(support.values()[nonself]),
+            support.shape, device=support.device).coalesce(), persistent=False)
+        self.missing_metadata = dict(
+            training_mask_rate=self.modality_mask_rate,
+            training_imputation='neighbor' if self.neighbor_imputation else 'zero',
+            mask_granularity='independent item rows per modality; fixed within an epoch',
+            mask_rng='numpy SeedSequence(run_seed, epoch, 20261026); local generator',
+            base_observation='all catalog feature rows observed; simulated missingness only',
+            imputation='binary nonself TRAIN support; observed-neighbor raw-feature mean',
+            fallback='zero', recursive=False, feature_block_size=256,
+            train_graph_fingerprint=self.behavior_view.cache_fingerprint)
         self.sparse_hypergraph.metadata.update(
             train_graph_fingerprint=self.behavior_view.cache_fingerprint,
             user_aggregation='train_mean', routing='deterministic', incidence_dropout=False,
             behavior_output_branch=True, behavior_eta=self.behavior_eta)
-        self.sparse_hypergraph.metadata['propagation'] = dict(
-            mode=self.hyper_propagation,
-            support_built=True, attention_computed=self.hyper_propagation == 'group',
-            effective_layers=self.n_hyper_layer if self.hyper_propagation == 'group' else 0,
-            item_input='cge_items',
-            item_output='group_propagated' if self.hyper_propagation == 'group' else 'identity',
-            user_readout='train_mean_of_hyper_items',
+        self.sparse_hypergraph.metadata.update(
+            item_input='cge_items', user_readout='train_mean_of_hyper_items',
             fusion='normalize_visual_plus_text_then_alpha')
-        getLogger().info('LGMRecOpt hypergraph propagation: %s',
-                         json.dumps(self.sparse_hypergraph.metadata['propagation']))
-        # Keep an explicit disabled marker for readers of experiment summaries.
-        self.sparse_hypergraph.metadata['item_contrast'] = dict(
-            enabled=False, computed=False, weight=0.0)
-        self.pre_epoch_processing()
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
-        self._eval_embeddings = None
-        revision = state_dict.get(prefix + '_architecture_revision')
-        if revision is not None and (
-                not isinstance(revision, torch.Tensor) or revision.numel() != 1
-                or revision.item() != ARCHITECTURE_REVISION):
-            error_msgs.append(f'{prefix}incompatible LGMRecOpt architecture revision; '
-                              f'expected {ARCHITECTURE_REVISION}')
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
-                                     missing_keys, unexpected_keys, error_msgs)
-
-    def train(self, mode=True):
-        # Trainer calls eval() at the start of each evaluation, including when
-        # already in eval mode. Never reuse representations across these calls.
-        self._eval_embeddings = None
-        return super().train(mode)
-
-    def _apply(self, fn, recurse=True):
-        # Cached tensors must not survive device/dtype changes.
-        self._eval_embeddings = None
-        return super()._apply(fn, recurse=recurse)
+        getLogger().info('LGMRecOpt missing-modality learning: %s',
+                         json.dumps(self.missing_metadata))
 
     def get_norm_adj_mat(self):
         """Symmetric degree-normalized TRAIN user-item adjacency."""
@@ -188,8 +184,52 @@ class LGMRecOpt(GeneralRecommender):
             features = torch.sparse.mm(self.norm_adj, features)
         return features
 
-    def forward(self, missing_modality=None, missing_items=None):
-        # Explicit inference-only intervention; ordinary training/VALID is unchanged.
+    def _observed_neighbor_counts(self, missing):
+        observed = (~missing).to(dtype=self._imputation_support.dtype)
+        return torch.sparse.mm(self._imputation_support, observed[:, None]).squeeze(1)
+
+    @torch.no_grad()
+    def _complete_features(self, raw_features, missing, imputation):
+        """Keep observations; fill only missing rows from original observed donors."""
+        if imputation not in ('zero', 'neighbor'):
+            raise ValueError('imputation must be zero or neighbor')
+        if not bool(missing.any()):
+            return raw_features
+        if imputation == 'zero':
+            return raw_features.masked_fill(missing[:, None], 0.0)
+        counts = self._observed_neighbor_counts(missing).clamp_min(1)[:, None]
+        completed = raw_features.clone()
+        # Bound intermediates by N x 256, never materialize N x K x raw_dim.
+        for start in range(0, raw_features.shape[1], 256):
+            stop = start + 256
+            observed_features = raw_features[:, start:stop].masked_fill(missing[:, None], 0.0)
+            means = torch.sparse.mm(self._imputation_support, observed_features) / counts
+            completed[missing, start:stop] = means[missing]
+        return completed
+
+    @torch.no_grad()
+    def _prepare_training_inputs(self):
+        """One deterministic, independent pair of masks per training epoch."""
+        if self.modality_mask_rate == 0:
+            return
+        epoch = max(self._mask_epoch, 0)
+        rng = np.random.default_rng(np.random.SeedSequence([self._mask_seed, epoch, 20261026]))
+        flags = rng.random((2, self.n_items)) < self.modality_mask_rate
+        device = self.item_id_embedding.weight.device
+        masks = tuple(torch.as_tensor(row, device=device) for row in flags)
+        mode = 'neighbor' if self.neighbor_imputation else 'zero'
+        self._train_inputs = tuple(
+            self._complete_features(raw, missing, mode)
+            for raw, missing in zip((self.image_embedding.weight, self.text_embedding.weight),
+                                    masks))
+        image, text = flags
+        getLogger().info('Training modality masks: %s', json.dumps(dict(
+            epoch=epoch, imputation=mode, full=int((~image & ~text).sum()),
+            image_missing=int((image & ~text).sum()), text_missing=int((~image & text).sum()),
+            both_missing=int((image & text).sum()))))
+
+    def forward(self, missing_modality=None, missing_items=None, imputation='zero'):
+        # Explicit masks are inference-only; TRAIN uses the epoch's cached inputs.
         if missing_modality is not None:
             if self.training:
                 raise ValueError('Input-missing diagnosis requires eval mode')
@@ -203,12 +243,16 @@ class LGMRecOpt(GeneralRecommender):
         collaborative = self.cge()
         image_input = self.image_embedding.weight
         text_input = self.text_embedding.weight
-        if missing_modality is not None:
-            observed = (~missing_items).to(device=image_input.device).unsqueeze(1)
+        if self.training and self.modality_mask_rate > 0:
+            if self._train_inputs is None:
+                self._prepare_training_inputs()
+            image_input, text_input = self._train_inputs
+        elif missing_modality is not None:
+            missing = missing_items.to(device=image_input.device)
             if missing_modality in ('image', 'both'):
-                image_input = image_input * observed
+                image_input = self._complete_features(image_input, missing, imputation)
             if missing_modality in ('text', 'both'):
-                text_input = text_input * observed
+                text_input = self._complete_features(text_input, missing, imputation)
         visual = torch.mm(image_input, self.item_image_trs)
         visual_local = self.mge(visual)
         textual = torch.mm(text_input, self.item_text_trs)
@@ -219,10 +263,7 @@ class LGMRecOpt(GeneralRecommender):
         global_views = []
         collaborative_items = collaborative[self.n_users:]
         for features in (visual, textual):
-            # Identity keeps the same local/global fusion and history readout;
-            # only the learned group mixing (and its gradient path) is removed.
-            items = (collaborative_items if self.hyper_propagation == 'identity'
-                     else self.sparse_hypergraph(collaborative_items, features))
+            items = self.sparse_hypergraph(collaborative_items, features)
             users = torch.sparse.mm(self.adj, items) * self.num_inters[:self.n_users]
             global_views.extend((users, items))
         uv, iv, ut, it = global_views
@@ -239,76 +280,19 @@ class LGMRecOpt(GeneralRecommender):
         final_items = items + self.behavior_eta * ri
         return final_users, final_items
 
-    @torch.no_grad()
-    def diagnose_missing(self, valid_data, expected_valid, mask_seed=20261021):
-        """Fixed-checkpoint VALID audit. Never use during training or model selection.
+    def bpr_loss(self, users, pos_items, neg_items):
+        pos_scores = torch.sum(torch.mul(users, pos_items), dim=1)
+        neg_scores = torch.sum(torch.mul(users, neg_items), dim=1)
+        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
+        return bpr_loss
 
-        Uses catalog-wide nested masks, shared across modalities/checkpoints.
-        Subgroup metrics average users with subgroup targets, retaining full ranks.
-        """
-        from utils.topk_evaluator import TopKEvaluator
-        from utils.metrics import recall_, ndcg_
-        if self.training:
-            raise ValueError('Call eval() before diagnosis')
-        if not expected_valid or not all(math.isfinite(float(value)) for value in expected_valid.values()):
-            raise ValueError('Expected finite reference VALID metrics from this checkpoint')
-        config = valid_data.config
-        evaluator = TopKEvaluator(config)
-        permutation = np.random.default_rng(mask_seed).permutation(self.n_items)
-        rows = []
-        positive = valid_data.get_eval_items()
-
-        def group_metrics(top, mask):
-            groups = {}
-            for name, flag in [('missing', True), ('observed', False)]:
-                targets = [set(int(j) for j in items if bool(mask[int(j)]) == flag) for items in positive]
-                selected = [i for i, items in enumerate(targets) if items]
-                values = dict(users=len(selected), targets=sum(len(targets[i]) for i in selected))
-                if selected:
-                    hit = np.asarray([[int(j) in targets[i] for j in top[i]] for i in selected])
-                    lengths = np.asarray([len(targets[i]) for i in selected])
-                    for metric, function in [('recall', recall_), ('ndcg', ndcg_)]:
-                        scores = function(hit, lengths)
-                        values.update({f'{metric}@{k}': float(scores[k-1]) for k in config['topk']})
-                groups[name] = values
-            return groups
-
-        scenarios = [(None, 0.)] + [(modality, ratio)
-                                   for modality in ('image', 'text', 'both') for ratio in (.2, .5)]
-        for modality, ratio in scenarios:
-            mask = np.zeros(self.n_items, dtype=bool)
-            mask[permutation[:int(self.n_items * ratio)]] = True
-            flags = torch.as_tensor(mask, device=self.item_id_embedding.weight.device)
-            users, items = self.forward(modality, flags if modality else None)
-            if not torch.isfinite(users).all() or not torch.isfinite(items).all():
-                raise FloatingPointError('Non-finite diagnostic representations')
-            matrices = []
-            for batch in valid_data:
-                scores = users[batch[0]] @ items.T
-                if not torch.isfinite(scores).all():
-                    raise FloatingPointError('Non-finite diagnostic scores')
-                scores[batch[1][0], batch[1][1]] = -1e10
-                matrices.append(torch.topk(scores, max(config['topk']), dim=-1).indices.cpu())
-            metrics = evaluator.evaluate(matrices, valid_data)
-            if not all(math.isfinite(float(value)) for value in metrics.values()):
-                raise FloatingPointError('Non-finite diagnostic metrics')
-            top = torch.cat(matrices).numpy()
-            if modality is None:
-                if set(metrics) != set(expected_valid) or any(abs(metrics[k]-expected_valid[k]) > 1e-7 for k in metrics):
-                    raise ValueError(f'Complete VALID does not match checkpoint: expected={expected_valid}, actual={metrics}')
-                baseline, complete_top = metrics, top.copy()
-            rows.append(dict(modality=modality or 'complete', ratio=ratio, missing_count=int(mask.sum()),
-                             mask_sha256=hashlib.sha256(mask.tobytes()).hexdigest(), metrics=metrics,
-                             retention={k: metrics[k]/baseline[k] if baseline[k] else None for k in metrics},
-                             groups=group_metrics(top, mask), complete_groups=group_metrics(complete_top, mask),
-                             mean_user_norm=float(users.norm(dim=1).mean()),
-                             mean_item_norm=float(items.norm(dim=1).mean())))
-            getLogger().info('Missing input diagnosis: %s', json.dumps(rows[-1]))
-        return dict(mask_seed=mask_seed, item_permutation=permutation.tolist(), results=rows,
-                    split='VALID', test_evaluated=False, complete_tolerance=1e-7,
-                    task='full-training-missing-inference',
-                    mask_rule='floor(ratio * catalog_size); same nested permutation for image/text/both',
-                    subgroup_rule='macro over users with subgroup targets; full-catalog ranks; subgroup IDCG')
+    def reg_loss(self, *embs):
+        """Preserve the original sum of unsquared L2 norms divided by batch size."""
+        reg_loss = 0
+        for emb in embs:
+            reg_loss += torch.norm(emb, p=2)
+        reg_loss /= embs[-1].shape[0]
+        return reg_loss
 
     def calculate_loss(self, interaction):
         """One TRAIN negative per positive; BPR plus the existing norm penalty."""
@@ -343,24 +327,41 @@ class LGMRecOpt(GeneralRecommender):
 
     def pre_epoch_processing(self):
         self._sums, self._count = {}, 0
+        self._mask_epoch += 1
+        self._eval_embeddings = None
+        self._train_inputs = None
+        # The trainer may call this hook before train(); do not inspect training.
+        self._prepare_training_inputs()
 
     def post_epoch_processing(self):
         return 'LGMRecOpt: ' + ', '.join(
             f'{key}={value / max(1, self._count):.6f}' for key, value in self._sums.items())
 
-    def bpr_loss(self, users, pos_items, neg_items):
-        pos_scores = torch.sum(torch.mul(users, pos_items), dim=1)
-        neg_scores = torch.sum(torch.mul(users, neg_items), dim=1)
-        bpr_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-        return bpr_loss
+    def train(self, mode=True):
+        # Trainer calls eval() at the start of each evaluation, including when
+        # already in eval mode. Never reuse representations across these calls.
+        self._eval_embeddings = None
+        return super().train(mode)
 
-    def reg_loss(self, *embs):
-        """Preserve the original sum of unsquared L2 norms divided by batch size."""
-        reg_loss = 0
-        for emb in embs:
-            reg_loss += torch.norm(emb, p=2)
-        reg_loss /= embs[-1].shape[0]
-        return reg_loss
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        self._eval_embeddings = None
+        self._train_inputs = None
+        revision = state_dict.get(prefix + '_architecture_revision')
+        if revision is not None and (
+                not isinstance(revision, torch.Tensor) or revision.numel() != 1
+                or revision.item() != ARCHITECTURE_REVISION):
+            error_msgs.append(f'{prefix}incompatible LGMRecOpt architecture revision; '
+                              f'expected {ARCHITECTURE_REVISION}')
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
+
+    def _apply(self, fn, recurse=True):
+        # Cached tensors must not survive device/dtype changes.
+        self._eval_embeddings = None
+        self._train_inputs = None
+        return super()._apply(fn, recurse=recurse)
+
 MSCA_STRUCT_TOPK = 10
 MSCA_MIN_COOCCURRENCE = 2  # equivalent to the authors' data > 1
 UPSTREAM_SOURCE = 'https://github.com/recomall/MSCA/blob/main/src/models/msca.py'
@@ -576,104 +577,3 @@ class SparseGroupHypergraph(nn.Module):
             current = torch.zeros_like(current).index_add_(0, self._item_ids, messages)
             current = current / mass.clamp_min(torch.finfo(current.dtype).tiny)[:, None]
         return current
-
-
-def _run_missing_diagnosis():
-    """Model-local command: python -m models.LGMRecopt --checkpoint PATH."""
-    import argparse
-    import csv
-    from datetime import datetime
-    from pathlib import Path
-    from uuid import uuid4
-    from utils.configurator import Config
-    from utils.dataset import RecDataset
-    from utils.dataloader import TrainDataLoader, EvalDataLoader
-    from utils.experiment_state import fingerprint_inputs, runtime_metadata
-    from utils.utils import init_seed
-
-    parser = argparse.ArgumentParser(description='Research-1 checkpoint: VALID input-missing diagnosis only')
-    parser.add_argument('--checkpoint', type=Path, required=True)
-    parser.add_argument('--data-dir', type=Path, default=Path('data'))
-    parser.add_argument('--output-dir', type=Path)
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--mask-seed', type=int, default=20261021)
-    args = parser.parse_args()
-    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
-    saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
-    source = saved['config']
-    expected_version = f'{IMPLEMENTATION_VERSION}-group'
-    if saved.get('model') != 'LGMRecOpt' or saved.get('implementation_version') != expected_version:
-        raise ValueError(f'Requires {expected_version} weights; historical checkpoints need their historical source')
-    if saved.get('protocol') != 'train_only' or source.get('report_test') is not False:
-        raise ValueError('Requires a TRAIN-only VALID-selected checkpoint')
-    if os.environ.get('LGMRECOPT_HYPER_PROPAGATION', 'group') != 'group':
-        raise ValueError('Unset LGMRECOPT_HYPER_PROPAGATION or set it to group')
-    config = Config('LGMRecOpt', saved['dataset'])
-    for key in list(config.final_config_dict):
-        if key in source:
-            config[key] = source[key]
-    config['data_path'] = str(args.data_dir.resolve()) + os.sep
-    config['device'] = torch.device(f'cuda:{args.gpu}' if source.get('use_gpu', True) and torch.cuda.is_available() else 'cpu')
-    config['gpu_id'] = args.gpu
-    config['save_recommended_topk'] = False
-    hashes, signature = fingerprint_inputs(config)
-    if signature != source.get('data_signature'):
-        raise ValueError('Checkpoint and input data fingerprints differ')
-    init_seed(int(config['seed']))
-    train, valid, _ = RecDataset(config).split()
-    train_data = TrainDataLoader(config, train, batch_size=config['train_batch_size'], shuffle=False)
-    valid_data = EvalDataLoader(config, valid, additional_dataset=train, batch_size=config['eval_batch_size'])
-    model = LGMRecOpt(config, train_data).to(config['device'])
-    for key, features in [('image_embedding.weight', model.image_embedding.weight),
-                          ('text_embedding.weight', model.text_embedding.weight)]:
-        if not torch.equal(saved['model_state_dict'][key].cpu(), features.detach().cpu()):
-            raise ValueError('Checkpoint contains modified input features: ' + key)
-    model.load_state_dict(saved['model_state_dict'], strict=True)
-    model.eval()
-    output = (args.output_dir or Path('log') / (
-        f'missing-LGMRecOpt-seed{config["seed"]}-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}')).resolve()
-    output.mkdir(parents=True, exist_ok=False)
-    metadata = dict(checkpoint=str(args.checkpoint.resolve()),
-                    checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
-                    checkpoint_version=saved['implementation_version'], epoch=saved['epoch'],
-                    seed=int(config['seed']), data_signature=signature, input_hashes=hashes,
-                    runtime=runtime_metadata(config['device']), finished=False)
-    try:
-        report = model.diagnose_missing(valid_data, saved['best_valid_result'], args.mask_seed)
-        report.update(metadata)
-        np.save(output / 'item-permutation.npy', np.asarray(report.pop('item_permutation'), dtype=np.int64))
-        with (output / 'metrics.csv').open('w', newline='', encoding='utf-8-sig') as handle:
-            keys = list(report['results'][0]['metrics'])
-            writer = csv.DictWriter(handle, fieldnames=['modality', 'ratio', 'missing_count'] + keys + ['retention_'+k for k in keys])
-            writer.writeheader()
-            for row in report['results']:
-                writer.writerow({**{k: row[k] for k in ['modality', 'ratio', 'missing_count']}, **row['metrics'],
-                                 **{'retention_'+k: v for k, v in row['retention'].items()}})
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
-        for axis, metric in zip(axes, ['recall@20', 'ndcg@20']):
-            for modality in ['image', 'text', 'both']:
-                rows = [report['results'][0]] + [r for r in report['results'] if r['modality'] == modality]
-                axis.plot([r['ratio'] for r in rows], [r['metrics'][metric] for r in rows], marker='o', label=modality)
-            axis.set(xlabel='Missing item fraction', ylabel=metric, title=f'Seed {config["seed"]}')
-            axis.legend()
-            axis.grid(alpha=.25)
-        fig.tight_layout()
-        fig.savefig(output / 'sensitivity.png', dpi=180)
-        fig.savefig(output / 'sensitivity.svg')
-        plt.close(fig)
-        report['finished'] = True
-        (output / 'results.json').write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-        for row in report['results']:
-            print(row['modality'], row['ratio'], row['metrics'])
-        print('VALID diagnosis saved:', output)
-    except Exception as exc:
-        metadata['error'] = str(exc)
-        (output / 'failure.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
-        raise
-
-
-if __name__ == '__main__':
-    _run_missing_diagnosis()
